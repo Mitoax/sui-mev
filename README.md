@@ -4,7 +4,11 @@
 ## Run 
 Start the bot with your private key.
 
+
 ```bash
+apt install llvm-dev libclang-dev clang
+apt install pkg-config
+
 cargo run -r --bin arb start-bot -- --private-key {}
 ```
 
