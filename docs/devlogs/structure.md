@@ -32,7 +32,15 @@ sui-mev/
 │   └── version/           # 版本管理
 ├── scripts/               # 脚本文件
 └── docs/                  # 文档
-    └── devlogs/          # 开发日志
+    ├── README.md             # 项目文档总览
+    ├── architecture.md       # 系统架构设计文档
+    ├── development-guide.md  # 开发指南
+    └── devlogs/             # 开发日志
+        ├── structure.md      # 代码架构文档
+        ├── memory.md         # 项目理解与需求
+        ├── dev_history.md    # 开发历史记录
+        ├── chain_analysis.md # 多链支持与套利策略分析
+        └── rules.md          # 开发规则与最佳实践
 ```
 
 ## 核心组件架构
