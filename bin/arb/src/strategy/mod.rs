@@ -1,5 +1,14 @@
-mod arb_cache;
-mod worker;
+//! # 套利策略核心模块
+//!
+//! 实现 MEV 套利的核心策略逻辑，负责：
+//! - 事件处理：监听公共交易、私有交易和 Shio 竞价事件
+//! - 机会识别：从交易事件中识别潜在的套利机会
+//! - 缓存管理：维护套利机会缓存，避免重复处理
+//! - 工作线程：管理多个工作线程并行处理套利任务
+//! - 状态同步：与模拟器和区块链状态保持同步
+
+mod arb_cache;  // 套利机会缓存管理
+mod worker;     // 工作线程实现
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -41,24 +50,56 @@ use crate::{
     types::{Action, Event, Source},
 };
 
+/// 套利策略主结构体
+/// 
+/// 负责协调整个套利系统的运行，包括事件处理、机会识别、
+/// 缓存管理和工作线程调度。
 pub struct ArbStrategy {
+    /// 套利交易的发送者地址
     sender: SuiAddress,
+    
+    /// 向工作线程发送套利任务的通道
     arb_item_sender: Option<Sender<ArbItem>>,
+    
+    /// 套利机会缓存，避免重复处理相同机会
     arb_cache: ArbCache,
 
+    /// 最近处理的套利币种队列，用于去重
     recent_arbs: VecDeque<String>,
+    /// 最大最近套利记录数
     max_recent_arbs: usize,
 
+    /// 模拟器对象池，用于并行模拟交易
     simulator_pool: Arc<ObjectPool<Box<dyn Simulator>>>,
-    own_simulator: Arc<dyn Simulator>, // only for execution of pending txs
+    /// 专用模拟器，仅用于执行待处理交易
+    own_simulator: Arc<dyn Simulator>,
+    
+    /// RPC 节点 URL
     rpc_url: String,
+    /// 工作线程数量
     workers: usize,
+    /// Sui 客户端
     sui: SuiClient,
+    /// 当前 epoch 信息（带缓存）
     epoch: Option<SimEpoch>,
+    /// 专用重放模拟器（可选）
     dedicated_simulator: Option<Arc<ReplaySimulator>>,
 }
 
 impl ArbStrategy {
+    /// 创建新的套利策略实例
+    /// 
+    /// # 参数
+    /// * `attacker` - 套利交易的发送者地址
+    /// * `simulator_pool` - 模拟器对象池
+    /// * `own_simulator` - 专用模拟器
+    /// * `recent_arbs` - 最大最近套利记录数
+    /// * `rpc_url` - RPC 节点 URL
+    /// * `workers` - 工作线程数量
+    /// * `dedicated_simulator` - 专用重放模拟器（可选）
+    /// 
+    /// # 返回
+    /// * `Self` - 套利策略实例
     pub async fn new(
         attacker: SuiAddress,
         simulator_pool: Arc<ObjectPool<Box<dyn Simulator>>>,
@@ -87,6 +128,16 @@ impl ArbStrategy {
         }
     }
 
+    /// 处理新的交易数据
+    /// 
+    /// 模拟交易执行，从中识别潜在的套利机会。
+    /// 
+    /// # 参数
+    /// * `tx` - 交易数据
+    /// 
+    /// # 返回
+    /// * `Result<()>` - 处理结果
+
     #[instrument(name = "on-new-tx", skip_all, fields(tx = %tx.digest()))]
     async fn on_new_tx(&self, tx: TransactionData) -> Result<()> {
         // 1. simulate
@@ -94,6 +145,17 @@ impl ArbStrategy {
         // 3. enqueue arb_item
         Ok(())
     }
+
+    /// 处理新的交易执行效果
+    /// 
+    /// 分析交易执行后的效果和事件，识别涉及的币种池并缓存套利机会。
+    /// 
+    /// # 参数
+    /// * `tx_effects` - 交易执行效果
+    /// * `events` - 交易产生的事件列表
+    /// 
+    /// # 返回
+    /// * `Result<()>` - 处理结果
 
     #[instrument(name = "on-new-tx-effects", skip_all, fields(tx = %tx_effects.transaction_digest()))]
     async fn on_new_tx_effects(&mut self, tx_effects: SuiTransactionBlockEffects, events: Vec<SuiEvent>) -> Result<()> {
@@ -114,6 +176,15 @@ impl ArbStrategy {
         Ok(())
     }
 
+    /// 处理新的 Shio 竞价项
+    /// 
+    /// 分析 Shio 竞价项中的交易，识别套利机会并设置竞价参数。
+    /// 
+    /// # 参数
+    /// * `shio_item` - Shio 竞价项
+    /// 
+    /// # 返回
+    /// * `Result<()>` - 处理结果
     #[instrument(name = "on-new-shio-item", skip_all, fields(tx = %shio_item.tx_digest()))]
     async fn on_new_shio_item(&mut self, shio_item: ShioItem) -> Result<()> {
         let (coin_pools, override_objects) = match self.get_potential_opportunity(&shio_item).await {
@@ -143,6 +214,15 @@ impl ArbStrategy {
         Ok(())
     }
 
+    /// 从事件中解析涉及的币种池
+    /// 
+    /// 并行处理事件列表，提取其中的交换事件并识别涉及的币种类型。
+    /// 
+    /// # 参数
+    /// * `events` - 事件列表
+    /// 
+    /// # 返回
+    /// * `HashSet<(String, Option<ObjectID>)>` - 币种和池ID的集合
     async fn parse_involved_coin_pools(&self, events: Vec<SuiEvent>) -> HashSet<(String, Option<ObjectID>)> {
         let mut join_set = JoinSet::new();
 
@@ -168,7 +248,16 @@ impl ArbStrategy {
         coin_pools
     }
 
-    // returns (involved_coin_pools, override_objects) if there are swap events.
+    /// 从 Shio 竞价项中获取潜在套利机会
+    /// 
+    /// 解析 Shio 竞价项中的事件和对象，提取涉及的币种池和覆盖对象。
+    /// 
+    /// # 参数
+    /// * `shio_item` - Shio 竞价项
+    /// 
+    /// # 返回
+    /// * `Option<(HashSet<(String, Option<ObjectID>)>, Vec<ObjectReadResult>)>` - 
+    ///   如果存在交换事件，返回涉及的币种池和覆盖对象
     async fn get_potential_opportunity(
         &self,
         shio_item: &ShioItem,
@@ -214,6 +303,12 @@ impl ArbStrategy {
         Some((involved_coin_pools, override_objects))
     }
 
+    /// 获取最新的 epoch 信息
+    /// 
+    /// 从缓存或 RPC 节点获取当前最新的 epoch 信息，用于模拟交易。
+    /// 
+    /// # 返回
+    /// * `Result<SimEpoch>` - 最新的 epoch 信息
     async fn get_latest_epoch(&mut self) -> Result<SimEpoch> {
         if let Some(epoch) = self.epoch {
             if !epoch.is_stale() {
@@ -229,6 +324,16 @@ impl ArbStrategy {
     }
 }
 
+/// 将 ShioObject 转换为 ObjectReadResult
+/// 
+/// 用于将 Shio 竞价项中的对象转换为模拟器可以使用的格式。
+/// 
+/// # 参数
+/// * `tx_digest` - 交易摘要
+/// * `shio_obj` - Shio 对象
+/// 
+/// # 返回
+/// * `Result<ObjectReadResult>` - 对象读取结果
 fn new_object_read_result(tx_digest: TransactionDigest, shio_obj: &ShioObject) -> Result<ObjectReadResult> {
     ensure!(
         shio_obj.data_type() == "moveObject",
@@ -263,6 +368,12 @@ fn new_object_read_result(tx_digest: TransactionDigest, shio_obj: &ShioObject) -
     Ok(ObjectReadResult::new(input_object_kind, object.into()))
 }
 
+/// 在 Tokio 运行时中执行异步代码的宏
+/// 
+/// 根据当前运行时的类型选择合适的执行方式：
+/// - 如果是单线程运行时，在新线程中创建单线程运行时执行
+/// - 如果是多线程运行时，使用 block_in_place 执行
+/// - 如果没有运行时，创建新的单线程运行时执行
 #[macro_export]
 macro_rules! run_in_tokio {
     ($code:expr) => {
@@ -290,12 +401,30 @@ macro_rules! run_in_tokio {
     };
 }
 
+/// 实现 burberry::Strategy trait
+/// 
+/// 将 ArbStrategy 集成到 burberry 事件处理框架中，
+/// 处理来自不同来源的事件并生成相应的动作。
 #[burberry::async_trait]
 impl burberry::Strategy<Event, Action> for ArbStrategy {
+    /// 返回策略名称
+    /// 
+    /// # 返回
+    /// * `&str` - 策略名称 "ArbStrategy"
     fn name(&self) -> &str {
         "ArbStrategy"
     }
 
+    /// 同步策略状态
+    /// 
+    /// 初始化工作线程池，启动套利处理任务。每个工作线程都会独立处理套利机会，
+    /// 并通过 ActionSubmitter 提交生成的动作。
+    /// 
+    /// # 参数
+    /// * `submitter` - 动作提交器，用于提交生成的套利动作
+    /// 
+    /// # 返回
+    /// * `Result<()>` - 同步结果
     async fn sync_state(&mut self, submitter: Arc<dyn ActionSubmitter<Action>>) -> Result<()> {
         if self.arb_item_sender.is_some() {
             panic!("already synced!");
@@ -359,6 +488,14 @@ impl burberry::Strategy<Event, Action> for ArbStrategy {
         Ok(())
     }
 
+    /// 处理事件
+    /// 
+    /// 根据事件类型调用相应的处理函数，并管理套利项的发送和过期清理。
+    /// 该函数会将识别到的套利机会发送给工作线程进行处理。
+    /// 
+    /// # 参数
+    /// * `event` - 待处理的事件（公共交易、私有交易或 Shio 竞价）
+    /// * `_submitter` - 动作提交器（未使用，由工作线程直接提交）
     async fn process_event(&mut self, event: Event, _submitter: Arc<dyn ActionSubmitter<Action>>) {
         let result = match event {
             Event::PublicTx(tx_effects, events) => self.on_new_tx_effects(tx_effects, events).await,
